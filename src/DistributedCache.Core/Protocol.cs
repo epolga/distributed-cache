@@ -114,7 +114,16 @@ public static class WireCodec
     {
         byte[]? bytes = await Frame.ReadAsync(stream, ct).ConfigureAwait(false);
         if (bytes is null) return null;
-        return JsonSerializer.Deserialize<WireMessage>(bytes, Options)
-               ?? throw new InvalidDataException("Empty/invalid wire message.");
+        try
+        {
+            return JsonSerializer.Deserialize<WireMessage>(bytes, Options)
+                   ?? throw new InvalidDataException("Empty/invalid wire message.");
+        }
+        catch (JsonException ex)
+        {
+            // InvalidDataException : IOException, so this is caught by every existing
+            // catch (IOException) call site without touching Node.cs - see Design.md.
+            throw new InvalidDataException("Malformed wire message.", ex);
+        }
     }
 }

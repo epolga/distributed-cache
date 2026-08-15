@@ -349,3 +349,49 @@ from each message's own header, so a tiny `GET` and a `SET` with a long value ge
 different-sized reads. `MaxPayloadBytes` (1 MiB) is not "the length we expect" - it's
 a ceiling used only to reject unreasonable values; real payloads are almost always
 far smaller than it.
+
+## A garbage frame with a plausible length used to kill a connection silently
+
+Framing (above) only guards the *length* prefix. It says nothing about whether the
+payload bytes that follow are valid JSON. Two garbage cases turned out to be handled
+very differently before this fix:
+
+- **Length itself is garbage** (negative, or bigger than `MaxPayloadBytes`) - already
+  caught by the bounds check in `Frame.ReadAsync`, which throws `InvalidDataException`.
+- **Length is small and in-range, but the payload bytes aren't valid JSON** - nothing
+  caught this. `JsonSerializer.Deserialize<WireMessage>` throws
+  `System.Text.Json.JsonException`, which does **not** derive from `IOException`. Every
+  existing error-handling call site (`HandleClientAsync`, `HandleReplicationConnectionAsync`
+  in `Node.cs`) only catches `IOException`, so the exception fell through, the
+  fire-and-forget task (`_ = HandleClientAsync(client, ct);`) became an unobserved task
+  exception, and the connection died with no response sent and no trace logged. The
+  `finally { _connectionLimiter.Release(); }` still ran, so the semaphore slot wasn't
+  leaked - only the sender got silence instead of an error.
+
+**The fix - one place, not several.** `Frame.ReadAsync` already throws
+`InvalidDataException` for its own bad-length case, and `InvalidDataException` derives
+from `IOException`. So `WireCodec.ReadMessageAsync` now catches `JsonException` and
+re-throws it wrapped as `InvalidDataException`, matching the existing convention
+instead of inventing a new one:
+
+```csharp
+public static async Task<WireMessage?> ReadMessageAsync(Stream stream, CancellationToken ct)
+{
+    byte[]? bytes = await Frame.ReadAsync(stream, ct).ConfigureAwait(false);
+    if (bytes is null) return null;
+    try
+    {
+        return JsonSerializer.Deserialize<WireMessage>(bytes, Options)
+               ?? throw new InvalidDataException("Empty/invalid wire message.");
+    }
+    catch (JsonException ex)
+    {
+        throw new InvalidDataException("Malformed wire message.", ex);
+    }
+}
+```
+
+Fixing it here, at the one place both call sites already funnel through, means every
+existing `catch (IOException)` block now handles malformed JSON the same way it already
+handles a dropped connection - without touching `Node.cs` at all. No new exception type
+for callers to learn, no new catch clause to duplicate at every read site.
