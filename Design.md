@@ -218,3 +218,73 @@ caught up on its own by chance. A single iteration could easily pass by accident
 Fifty consecutive iterations, with no artificial delay giving replication extra time
 to "naturally" catch up, make a broken guarantee show up reliably instead of
 sometimes.
+
+## Loopback is hardcoded in two different places, for two different reasons
+
+```
+src/DistributedCache.Core/Node.cs:65:   _clientListener = new TcpListener(IPAddress.Loopback, ClientPort);
+src/DistributedCache.Core/Node.cs:75:   _replicationListener = new TcpListener(IPAddress.Loopback, ReplicationPort.Value);
+src/DistributedCache.App/Program.cs:13: ReplicaTargets = new[] { new ReplicaTarget("127.0.0.1", 6101), ... }
+```
+
+**`Node.cs` - a real constraint in the library itself, not just the demo.**
+`IPAddress.Loopback` means "only accept connections from this same machine." On a
+real server, where clients or peer nodes live on other machines, connections
+wouldn't even reach the listener. For real deployment this would need to become
+`IPAddress.Any` (listen on every network interface) - this isn't a demo-only detail,
+it's baked into `Node`'s constructor.
+
+**`Program.cs` - a natural consequence of running everything in one process.** Since
+all three nodes live in one process on one machine, `127.0.0.1` is the only address
+that makes sense here. On three real machines these would be real IPs/hostnames
+(`"10.0.1.12"`, `"replica-b.internal"`) - `TcpClient.ConnectAsync(host, port, ct)`
+already resolves hostnames via DNS on its own, nothing extra needed there.
+
+**What's honestly missing:** unlike a from-scratch real deployment would need, this
+project has no per-machine entry point at all - `DistributedCache.App` is purely an
+in-process demo. Actually running this on three machines would need two things:
+switching `IPAddress.Loopback` to `IPAddress.Any` in `Node.cs`, and a separate `Main`
+that builds a single `NodeConfig` from something external (environment variables, a
+config file) instead of hardcoding all three nodes in one file.
+
+## Can a Replica ever receive a `REPLICATE` before its own `HELLO` went out?
+
+No - this is structurally impossible, not just unlikely, given how both sides are
+sequenced plus TCP's own ordering guarantee.
+
+**Replica side** (`HandleReplicationConnectionAsync`): the read loop doesn't start
+until the `HELLO` write has fully `await`-ed, including `Frame.WriteAsync`'s explicit
+`FlushAsync` - so by the time this code could possibly read anything, its own `HELLO`
+bytes have already been handed to the transport, not just queued somewhere in memory.
+
+```csharp
+await WireCodec.WriteMessageAsync(stream, new WireMessage { Kind = WireKind.Hello, ... }, ct)...;
+while (!ct.IsCancellationRequested)
+{
+    msg = await WireCodec.ReadMessageAsync(stream, ct)...; // only starts after the write above
+    ...
+}
+```
+
+**Primary side** (`ReplicaLinkLoopAsync`): the send loop doesn't start until `HELLO`
+has been fully read.
+
+```csharp
+var hello = await WireCodec.ReadMessageAsync(stream, ct)...; // read HELLO first
+long lastSent = hello.Seq ?? 0;
+while (!ct.IsCancellationRequested)
+{
+    foreach (var entry in _log!.From(lastSent))
+        await WireCodec.WriteMessageAsync(stream, new WireMessage { Kind = WireKind.Replicate, ... }, ct)...; // only now
+    ...
+}
+```
+
+**Putting the two together with TCP's ordering guarantee:** for Primary to have read
+a `HELLO` at all, the Replica must have already sent it (TCP delivers bytes on one
+connection in the order they were sent, never out of order). And Primary won't send a
+single `REPLICATE` until that read completes. So the chain - Replica writes `HELLO` →
+Primary reads it → Primary writes `REPLICATE` → Replica reads it - can't have a link
+happen before the one before it, on either side, ever. Each connection also starts
+this sequence from scratch, so a previous (now-dead) connection's in-flight bytes
+can't leak into a new one either.

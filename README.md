@@ -1,7 +1,7 @@
 # Distributed Cache — 3-node Primary/Replica over TCP
 
 A fixed-topology, in-memory cache: one Primary (writes) and two Replicas (reads),
-replicated over a hand-rolled length-prefixed TCP protocol. See `NOTES.md` for the
+replicated over a hand-rolled length-prefixed TCP protocol. See `Design.md` for the
 design decisions behind it.
 
 ## Layout
