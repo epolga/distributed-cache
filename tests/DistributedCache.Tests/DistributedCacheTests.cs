@@ -8,9 +8,8 @@ public class DistributedCacheTests
     [Fact]
     public async Task HappyPath_SetThenGetOnPrimary_ReturnsWrittenValue()
     {
-        var primary = TestHarness.CreatePrimary("A", out _);
+        await using var primary = TestHarness.CreatePrimary("A", out _);
         await primary.StartAsync();
-        await using var _dispose = primary;
         await using var client = TestHarness.ClientFor(primary);
 
         await client.SetAsync("users/1", "Olga");
@@ -23,9 +22,8 @@ public class DistributedCacheTests
     [Fact]
     public async Task Set_SentToReplica_IsRejectedWithNotPrimary()
     {
-        var replica = TestHarness.CreateReplica("B", out _, out _);
+        await using var replica = TestHarness.CreateReplica("B", out _, out _);
         await replica.StartAsync();
-        await using var _dispose = replica;
         await using var client = TestHarness.ClientFor(replica);
 
         var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => client.SetAsync("users/1", "Olga"));
@@ -35,12 +33,10 @@ public class DistributedCacheTests
     [Fact]
     public async Task ReadYourWrites_GetOnReplicaWithMinSeq_NeverObservesStaleValue()
     {
-        var replicaB = TestHarness.CreateReplica("B", out _, out int replPortB);
-        var primary = TestHarness.CreatePrimary("A", out _, new ReplicaTarget("127.0.0.1", replPortB));
+        await using var replicaB = TestHarness.CreateReplica("B", out _, out int replPortB);
+        await using var primary = TestHarness.CreatePrimary("A", out _, new ReplicaTarget("127.0.0.1", replPortB));
         await replicaB.StartAsync();
         await primary.StartAsync();
-        await using var d1 = replicaB;
-        await using var d2 = primary;
         await Task.Delay(200); // let the replica link establish once, before the loop below
 
         await using var writer = TestHarness.ClientFor(primary);
@@ -62,16 +58,13 @@ public class DistributedCacheTests
     [Fact]
     public async Task ConcurrentWrites_ToPrimary_ConvergeOnAllReplicas()
     {
-        var replicaB = TestHarness.CreateReplica("B", out _, out int replPortB);
-        var replicaC = TestHarness.CreateReplica("C", out _, out int replPortC);
-        var primary = TestHarness.CreatePrimary("A", out _,
+        await using var replicaB = TestHarness.CreateReplica("B", out _, out int replPortB);
+        await using var replicaC = TestHarness.CreateReplica("C", out _, out int replPortC);
+        await using var primary = TestHarness.CreatePrimary("A", out _,
             new ReplicaTarget("127.0.0.1", replPortB), new ReplicaTarget("127.0.0.1", replPortC));
         await replicaB.StartAsync();
         await replicaC.StartAsync();
         await primary.StartAsync();
-        await using var d1 = replicaB;
-        await using var d2 = replicaC;
-        await using var d3 = primary;
         await Task.Delay(200);
 
         const int writerCount = 10;
@@ -104,11 +97,10 @@ public class DistributedCacheTests
     [Fact]
     public async Task LateJoiningReplica_CatchesUpOnHistoryWrittenBeforeItConnected()
     {
-        var lateReplica = TestHarness.CreateReplica("B", out _, out int replPort);
-        var primary = TestHarness.CreatePrimary("A", out _, new ReplicaTarget("127.0.0.1", replPort));
+        await using var lateReplica = TestHarness.CreateReplica("B", out _, out int replPort);
+        await using var primary = TestHarness.CreatePrimary("A", out _, new ReplicaTarget("127.0.0.1", replPort));
 
         await primary.StartAsync();
-        await using var d1 = primary;
         await using var writer = TestHarness.ClientFor(primary);
 
         for (int i = 0; i < 25; i++)
@@ -116,7 +108,6 @@ public class DistributedCacheTests
         long finalSeq = primary.AppliedSeq;
 
         await lateReplica.StartAsync(); // now the primary's retry loop can finally connect
-        await using var d2 = lateReplica;
 
         await using var reader = TestHarness.ClientFor(lateReplica);
         var (found, value) = await reader.GetAsync("k24", minSeq: finalSeq);
