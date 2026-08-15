@@ -6,7 +6,7 @@ public sealed record ReplicationEntry(long Seq, string Op, string Key, string? V
 /// Primary-only: the full in-order history of applied writes, kept purely in memory.
 /// This is what makes "reconnect and resend, including already-applied messages" possible
 /// without disk persistence (which is out of scope) - the tradeoff is that this list grows
-/// for the lifetime of the process (see NOTES.md, "what was left out").
+/// for the lifetime of the process (see KeyDecisions.md, "what was left out").
 /// </summary>
 public sealed class ReplicationLog
 {

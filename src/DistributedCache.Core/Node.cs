@@ -153,7 +153,7 @@ public sealed class Node : IAsyncDisposable
     private async Task HandleClientAsync(TcpClient client, CancellationToken ct)
     {
         // Bounds the number of connections actively being served - a slow/malicious burst of
-        // connects queues here instead of spawning unbounded reader tasks (see NOTES.md).
+        // connects queues here instead of spawning unbounded reader tasks (see KeyDecisions.md).
         await _connectionLimiter.WaitAsync(ct).ConfigureAwait(false);
         try
         {
@@ -333,7 +333,7 @@ public sealed class Node : IAsyncDisposable
                 _logger.LogWarning(
                     "{Node} [AppliedSeq={AppliedSeq}]: skipped already-applied seq {Seq} - " +
                     "expected after a resend/reconnect, but also how the primary-restart seq-collision bug " +
-                    "in Design.md would manifest", Name, _appliedSeq.Value, seq);
+                    "in KeyDecisions.md would manifest", Name, _appliedSeq.Value, seq);
                 return; // already applied - dedup after resend/reconnect (convergence requirement)
             }
 

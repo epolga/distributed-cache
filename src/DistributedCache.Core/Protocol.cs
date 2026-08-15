@@ -122,7 +122,7 @@ public static class WireCodec
         catch (JsonException ex)
         {
             // InvalidDataException : IOException, so this is caught by every existing
-            // catch (IOException) call site without touching Node.cs - see Design.md.
+            // catch (IOException) call site without touching Node.cs - see DESIGN.md and KeyDecisions.md.
             throw new InvalidDataException("Malformed wire message.", ex);
         }
     }

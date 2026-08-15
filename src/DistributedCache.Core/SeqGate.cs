@@ -9,7 +9,7 @@ namespace DistributedCache.Core;
 ///
 /// A monotonic value under a lock, checked on a short poll interval by anyone waiting.
 /// Correctness does not depend on the poll interval: WaitForAsync always re-reads the
-/// live Value, so a "stale" read between polls can never happen - see NOTES.md.
+/// live Value, so a "stale" read between polls can never happen - see KeyDecisions.md.
 /// </summary>
 public sealed class SeqGate
 {

@@ -682,3 +682,19 @@ timestamps land:
 14:45:15.436 info: DistributedCache.Core.Node[0] B [AppliedSeq=1]: stopped
 14:45:15.436 info: DistributedCache.Core.Node[0] C [AppliedSeq=1]: stopped
 ```
+
+**Why `CacheClient` got the same treatment, briefly, despite the earlier reasoning
+that its exceptions already reach the caller directly** (no fire-and-forget task to
+lose them in, unlike `Node`): a caller can still catch and swallow that exception
+without logging it themselves, so a log-then-rethrow record is still worth having for
+later forensics. One catch clause in `SendAsync` covers all of it -
+`catch (Exception ex) when (ex is IOException or SocketException)` - two types because
+`TcpClient.ConnectAsync` failing (refused/unreachable) raises `SocketException`, not
+`IOException`, unlike `NetworkStream` read/write failures. Successful `GET`s aren't
+logged, same as `Node` doesn't log successful `GET`s server-side - only writes and
+failures are worth a line. A real captured line, same run as above:
+
+```
+14:51:08.100 info: DistributedCache.Core.CacheClient[0] 127.0.0.1:6000: connected
+14:51:08.101 info: DistributedCache.Core.CacheClient[0] 127.0.0.1:6000: SET key=users/1 seq=1
+```

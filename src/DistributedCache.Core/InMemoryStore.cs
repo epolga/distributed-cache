@@ -2,7 +2,7 @@ using System.Collections.Concurrent;
 
 namespace DistributedCache.Core;
 
-/// <summary>Plain in-memory key/value store. No eviction, no TTL, no persistence (by design - see NOTES.md).</summary>
+/// <summary>Plain in-memory key/value store. No eviction, no TTL, no persistence (by design - see KeyDecisions.md).</summary>
 public sealed class InMemoryStore
 {
     private readonly ConcurrentDictionary<string, string?> _data = new();
