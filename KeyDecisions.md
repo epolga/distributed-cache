@@ -912,3 +912,62 @@ whether there's real data to replicate) would surface a truly silent partition f
 faster and more predictably. Unlike the other two items in this section, this isn't a
 tradeoff with a real upside to the current choice - it's a gap: the current design
 just never added a liveness check beyond "did the last actual operation fail."
+
+## Considered and rejected: hiding `Seq` from the caller behind a server-tracked session
+
+**The itch this scratches:** `SetAsync`/`DeleteAsync` return a `Seq` the caller must
+hold onto and pass back into `GetAsync(key, minSeq: seq)` - the caller has to know a
+sequence number exists at all. Could the read-your-writes guarantee be provided
+without ever exposing that number?
+
+**First cut: hide it inside one `CacheClient` instance.** Have `CacheClient` remember
+its own last-written `Seq` privately, and have `GetAsync` apply it automatically with
+no `minSeq` parameter at all. This fully works - but only for reads and writes that go
+through the *same* `CacheClient` object. It does nothing for
+`ReadYourWrites_GetOnReplicaWithMinSeq_NeverObservesStaleValue`'s actual scenario,
+where `writer` and `reader` are deliberately two different objects (simulating the
+same logical caller reading through a different connection than it wrote through) -
+that case needs *some* token to travel between the two objects no matter what it's
+called, because the reading side cannot know whether a specific write has landed
+without a reference to *which* write.
+
+**Re-reading the assignment's actual guarantee mattered here.** It's explicitly
+per-writer - "must never observe a state older than **its** write" - not a
+cluster-wide freshest-value guarantee. That's what makes hiding `Seq` behind a
+*client identity* a real option, not just the single-object case above: if the server
+tracked "the last `Seq` this specific client wrote" keyed by some stable client
+identity, a `GetAsync` carrying only that identity (no `Seq` at all, ever, in the
+public API) could resolve the wait target itself.
+
+**What that would actually take:**
+
+1. Nothing identifies "the client" today beyond the raw TCP connection
+   (`client.Client.RemoteEndPoint`), which doesn't survive a reconnect (a new
+   `TcpClient` gets a new ephemeral port) and isn't stable across separate
+   `CacheClient` objects. No authentication exists to derive a real identity from
+   (explicitly out of scope). So `CacheClient` would need an opaque `ClientId`,
+   supplied once (e.g. at construction) instead of threaded through every call -
+   already a real ergonomic win over `minSeq`, which has to be correlated per write.
+2. `HandleSet`/`HandleDelete` would update a `ConcurrentDictionary<string, long>`
+   (`ClientId → Seq`) in the same locked block that already advances `_appliedSeq` -
+   cheap, no new concurrency concern.
+3. **The real complexity:** a Replica never observes a write directly, only via
+   `REPLICATE` - so a `GET` landing on a Replica with only a `ClientId` has no way to
+   resolve it locally unless that mapping is *replicated too*. `WireMessage` and
+   `ReplicationEntry` would need a `ClientId` field, and `ApplyReplicatedEntry` would
+   need to maintain the same dictionary on every node, updated alongside `_store` and
+   `_appliedSeq` - a second piece of replicated state, parallel to the existing one,
+   not a client-side-only change.
+4. That dictionary grows unboundedly by distinct `ClientId`, same category of "grows
+   forever" limitation `_log` and `_store` already carry, just a third thing keeping
+   it company.
+
+**Why not built:** the guarantee is already fully satisfied by the existing explicit
+`minSeq`, verified by a real test. This would change API ergonomics only - not the
+observable guarantee - at the cost of a new wire-protocol field, a second replicated
+map with its own unbounded growth, and an unauthenticated identity string with no
+collision protection (nothing stops two different real clients from picking the same
+`ClientId`). Scope the assignment explicitly asks to spend restraint on
+("we'd rather read 400 lines you can fully defend than 1,500 you cannot") is better
+spent elsewhere than on hiding a `long` the caller already has to receive from
+`SetAsync` regardless.

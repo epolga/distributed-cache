@@ -134,6 +134,14 @@ which is an accepted simplification, not a monitored/alerted condition).
 - **No connection limiter on the replication-accept side**, unlike the client-facing
   side (`_connectionLimiter`). Harmless on the fixed loopback topology; would matter
   on an open network.
+- **`Seq` is visible to the caller** (`SetAsync`/`DeleteAsync` return it, `GetAsync`
+  takes it as `minSeq`), rather than hidden behind a server-tracked client session.
+  Considered and rejected: the assignment's guarantee is explicitly per-writer, not
+  cluster-wide, so an explicit token the caller passes along is the minimal mechanism
+  that satisfies it. A hidden-session version would need `ClientId` added to the wire
+  protocol and *replicated* alongside every write (a Replica never sees a write
+  directly, only via `REPLICATE`), plus a new unbounded `ClientId → Seq` map on every
+  node - real new surface for no change in the guarantee itself, just API ergonomics.
 
 ## Testing notes
 
