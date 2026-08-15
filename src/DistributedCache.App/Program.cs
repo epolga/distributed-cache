@@ -28,9 +28,9 @@ await replicaC.StartAsync();
 await primary.StartAsync();
 await Task.Delay(300); // let the replica links connect
 
-await using var writer = new CacheClient("127.0.0.1", primary.ClientPort);
-await using var readerB = new CacheClient("127.0.0.1", replicaB.ClientPort);
-await using var readerC = new CacheClient("127.0.0.1", replicaC.ClientPort);
+await using var writer = new CacheClient("127.0.0.1", primary.ClientPort, loggerFactory.CreateLogger<CacheClient>());
+await using var readerB = new CacheClient("127.0.0.1", replicaB.ClientPort, loggerFactory.CreateLogger<CacheClient>());
+await using var readerC = new CacheClient("127.0.0.1", replicaC.ClientPort, loggerFactory.CreateLogger<CacheClient>());
 
 long seq = await writer.SetAsync("users/1", "Olga");
 Console.WriteLine($"SET users/1 = Olga  (seq={seq})");
