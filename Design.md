@@ -576,7 +576,7 @@ applied to `_store`, but `minSeq` would never be considered "reached." Advancing
 replica has processed everything up to and including operation N," rather than "up to
 and including the Nth *set*."
 
-## Logging: `ILogger<Node>`, added because "caught" isn't "visible"
+## Logging: `ILogger<Node>`, with `AppliedSeq` (not wall-clock time) for cross-node order
 
 **Motivation.** Before this, every error path in `Node.cs` was either silent
 (`catch (IOException) { /* peer gone */ }`) or, worse, actively swallowed an exception
@@ -595,30 +595,42 @@ provider) - `DistributedCache.App` is the one that references
 `Microsoft.Extensions.Logging.Console` and actually constructs a console logger, since
 deciding *where* logs go is a composition-root concern, not a library concern.
 
-**Every message includes the node's own name** (`Name`, the same field passed as
-`NodeConfig.Name`) as the first structured parameter, since on three real machines the
-log lines from all three nodes could easily end up interleaved in one place (a shared
-log aggregator, or even just three terminals scrolled together) - without the name, a
-line like "lost connection to replica" wouldn't say whose replica. A real line from the
-demo:
+**Every line carries three things: the node's name, a UTC timestamp, and its own
+`AppliedSeq` - each answering a different question.** `Name` says whose line it is,
+once three nodes' logs are interleaved. The timestamp (`TimestampFormat` +
+`UseUtcTimestamp = true` in the demo's console formatter) answers "roughly when," for
+a human eyeballing a rough window - "something went wrong around 14:40." `AppliedSeq`
+answers something a clock can't: on three *real* machines, wall-clock time is exactly
+what this project already argued can't be trusted for ordering between nodes - the
+whole reason `Seq` exists instead of a timestamp in the wire protocol (see the
+Lamport-clock discussion this grew out of). `_appliedSeq.Value` is the one value this
+system already computes that's guaranteed monotonic per node regardless of any clock
+(`SeqGate.Advance` only moves forward). Two lines from *different* nodes can be
+compared by `AppliedSeq` and the comparison means something real - "A reached
+AppliedSeq=1 before B or C did" is a fact, not an inference from possibly-skewed
+clocks. In practice: the timestamp finds the neighborhood of an incident; `AppliedSeq`
+settles who-did-what-first once you're standing in it.
 
-```
-info: DistributedCache.Core.Node[0]
-      A: connected to replica ReplicaTarget { Host = 127.0.0.1, Port = 6101 }, resuming replication from seq 0
-```
+This ambient `[AppliedSeq=N]` (the node's state *when the line was written*) is a
+different thing from the **event-specific** `Seq`/`MinSeq` some lines also carry (the
+Seq *the line is actually about* - a write, a wait target, a dedup check). For the
+node that just performed a write, the two coincide on the same line - not a bug,
+just `_appliedSeq.Advance(seq)` running in the same locked block as the write itself.
 
 **What's logged, and at what level:**
 
 | Where | Level | What |
 |---|---|---|
 | `StartAsync`/`StopAsync` | Information | role, ports, stop |
-| `HandleClientAsync` read - malformed frame | Warning | includes the client's remote endpoint and the exception |
+| `HandleClientAsync` read - malformed frame | Warning | client's remote endpoint + exception |
 | `HandleClientAsync` read - clean disconnect | Debug | routine, not an error |
 | `HandleSet`/`HandleDelete` - `NOT_PRIMARY` | Warning | a client wrote to the wrong node |
+| `HandleSet`/`HandleDelete` - success | Information | key + the write's own Seq |
 | `HandleGetAsync` - `STALE_TIMEOUT` | Warning | a replica didn't catch up to `minSeq` in time |
 | `HandleReplicationConnectionAsync` - accept, HELLO sent | Information | |
 | `HandleReplicationConnectionAsync` - malformed frame / lost primary | Warning | |
 | `ApplyReplicatedEntry` - dedup skip (`seq <= AppliedSeq`) | Warning | see below |
+| `ApplyReplicatedEntry` - success | Information | op, key, Seq |
 | `ReplicaLinkLoopAsync` - connected, resuming from seq N | Information | |
 | `ReplicaLinkLoopAsync` - lost replica, retrying | Warning | includes the exception |
 
@@ -635,13 +647,38 @@ message says so directly rather than making the reader re-derive it.
 
 ```csharp
 using var loggerFactory = LoggerFactory.Create(builder => builder
-    .AddSimpleConsole(o => o.SingleLine = true)
+    .AddSimpleConsole(o =>
+    {
+        o.SingleLine = true;
+        o.UseUtcTimestamp = true;
+        o.TimestampFormat = "HH:mm:ss.fff ";
+    })
     .SetMinimumLevel(LogLevel.Information));
 
 var replicaB = new Node(new NodeConfig { ... }, loggerFactory.CreateLogger<Node>());
 ```
 
-Running the demo now prints, in order: each node starting, the replication handshake
-(accept → HELLO sent → primary resumes from the reported seq) for both replicas, and
-each node stopping - all three nodes' lines distinguishable by name even though
-they're interleaved in one console.
+A real captured run - note the two new `applied SET`/`applied replicated SET` lines,
+and `AppliedSeq` reaching 1 on `A` (the Primary's own write) before it does on `B`/`C`
+(the replicated copies), which is a causal fact regardless of how close together the
+timestamps land:
+
+```
+14:45:15.056 info: DistributedCache.Core.Node[0] B [AppliedSeq=0]: started as Replica, listening for clients on port 6001
+14:45:15.070 info: DistributedCache.Core.Node[0] B [AppliedSeq=0]: listening for replication connections on port 6101
+14:45:15.071 info: DistributedCache.Core.Node[0] C [AppliedSeq=0]: started as Replica, listening for clients on port 6002
+14:45:15.071 info: DistributedCache.Core.Node[0] C [AppliedSeq=0]: listening for replication connections on port 6102
+14:45:15.071 info: DistributedCache.Core.Node[0] A [AppliedSeq=0]: started as Primary, listening for clients on port 6000
+14:45:15.078 info: DistributedCache.Core.Node[0] C [AppliedSeq=0]: accepted replication connection from 127.0.0.1:54583
+14:45:15.078 info: DistributedCache.Core.Node[0] B [AppliedSeq=0]: accepted replication connection from 127.0.0.1:54582
+14:45:15.098 info: DistributedCache.Core.Node[0] B [AppliedSeq=0]: sent HELLO reporting AppliedSeq=0
+14:45:15.098 info: DistributedCache.Core.Node[0] C [AppliedSeq=0]: sent HELLO reporting AppliedSeq=0
+14:45:15.101 info: DistributedCache.Core.Node[0] A [AppliedSeq=0]: connected to replica ReplicaTarget { Host = 127.0.0.1, Port = 6101 }, resuming replication from seq 0
+14:45:15.101 info: DistributedCache.Core.Node[0] A [AppliedSeq=0]: connected to replica ReplicaTarget { Host = 127.0.0.1, Port = 6102 }, resuming replication from seq 0
+14:45:15.376 info: DistributedCache.Core.Node[0] A [AppliedSeq=1]: applied SET key=users/1 seq=1
+14:45:15.402 info: DistributedCache.Core.Node[0] B [AppliedSeq=1]: applied replicated SET key=users/1 seq=1
+14:45:15.402 info: DistributedCache.Core.Node[0] C [AppliedSeq=1]: applied replicated SET key=users/1 seq=1
+14:45:15.436 info: DistributedCache.Core.Node[0] A [AppliedSeq=1]: stopped
+14:45:15.436 info: DistributedCache.Core.Node[0] B [AppliedSeq=1]: stopped
+14:45:15.436 info: DistributedCache.Core.Node[0] C [AppliedSeq=1]: stopped
+```

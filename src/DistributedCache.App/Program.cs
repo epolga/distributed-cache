@@ -5,7 +5,12 @@ using Microsoft.Extensions.Logging;
 // and exercises the primary write-path + read-your-writes.
 
 using var loggerFactory = LoggerFactory.Create(builder => builder
-    .AddSimpleConsole(o => o.SingleLine = true)
+    .AddSimpleConsole(o =>
+    {
+        o.SingleLine = true;
+        o.UseUtcTimestamp = true;
+        o.TimestampFormat = "HH:mm:ss.fff ";
+    })
     .SetMinimumLevel(LogLevel.Information));
 
 var replicaB = new Node(new NodeConfig { Name = "B", Role = NodeRole.Replica, ClientPort = 6001, ReplicationPort = 6101 }, loggerFactory.CreateLogger<Node>());

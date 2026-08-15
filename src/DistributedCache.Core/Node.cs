@@ -90,13 +90,13 @@ public sealed class Node : IAsyncDisposable
         var ct = _cts.Token;
 
         _clientListener.Start();
-        _logger.LogInformation("{Node}: started as {Role}, listening for clients on port {ClientPort}", Name, Role, ClientPort);
+        _logger.LogInformation("{Node} [AppliedSeq={AppliedSeq}]: started as {Role}, listening for clients on port {ClientPort}", Name, _appliedSeq.Value, Role, ClientPort);
         _backgroundTasks.Add(Task.Run(() => AcceptClientsLoopAsync(ct), ct));
 
         if (Role == NodeRole.Replica)
         {
             _replicationListener!.Start();
-            _logger.LogInformation("{Node}: listening for replication connections on port {ReplicationPort}", Name, ReplicationPort);
+            _logger.LogInformation("{Node} [AppliedSeq={AppliedSeq}]: listening for replication connections on port {ReplicationPort}", Name, _appliedSeq.Value, ReplicationPort);
             _backgroundTasks.Add(Task.Run(() => AcceptReplicationLoopAsync(ct), ct));
         }
         else
@@ -125,7 +125,7 @@ public sealed class Node : IAsyncDisposable
         _cts.Dispose();
         _cts = null;
         _backgroundTasks.Clear();
-        _logger.LogInformation("{Node}: stopped", Name);
+        _logger.LogInformation("{Node} [AppliedSeq={AppliedSeq}]: stopped", Name, _appliedSeq.Value);
     }
 
     public ValueTask DisposeAsync() => new(StopAsync());
@@ -170,12 +170,12 @@ public sealed class Node : IAsyncDisposable
                     }
                     catch (InvalidDataException ex)
                     {
-                        _logger.LogWarning(ex, "{Node}: malformed frame from client {Endpoint}, dropping connection", Name, client.Client.RemoteEndPoint);
+                        _logger.LogWarning(ex, "{Node} [AppliedSeq={AppliedSeq}]: malformed frame from client {Endpoint}, dropping connection", Name, _appliedSeq.Value, client.Client.RemoteEndPoint);
                         return;
                     }
                     catch (IOException)
                     {
-                        _logger.LogDebug("{Node}: client {Endpoint} disconnected", Name, client.Client.RemoteEndPoint);
+                        _logger.LogDebug("{Node} [AppliedSeq={AppliedSeq}]: client {Endpoint} disconnected", Name, _appliedSeq.Value, client.Client.RemoteEndPoint);
                         return; // peer reset/closed abruptly
                     }
                     if (request is null) return; // clean disconnect
@@ -207,7 +207,7 @@ public sealed class Node : IAsyncDisposable
             bool caughtUp = await _appliedSeq.WaitForAsync(minSeq, ReadYourWritesTimeout, ct).ConfigureAwait(false);
             if (!caughtUp)
             {
-                _logger.LogWarning("{Node}: read-your-writes wait for seq {MinSeq} timed out after {Timeout}", Name, minSeq, ReadYourWritesTimeout);
+                _logger.LogWarning("{Node} [AppliedSeq={AppliedSeq}]: read-your-writes wait for seq {MinSeq} timed out after {Timeout}", Name, _appliedSeq.Value, minSeq, ReadYourWritesTimeout);
                 return new WireMessage { Kind = WireKind.Response, Status = WireStatus.StaleTimeout };
             }
         }
@@ -222,7 +222,7 @@ public sealed class Node : IAsyncDisposable
     {
         if (Role != NodeRole.Primary)
         {
-            _logger.LogWarning("{Node}: rejected SET for key {Key} - not primary", Name, request.Key);
+            _logger.LogWarning("{Node} [AppliedSeq={AppliedSeq}]: rejected SET for key {Key} - not primary", Name, _appliedSeq.Value, request.Key);
             return new WireMessage { Kind = WireKind.Response, Status = WireStatus.NotPrimary };
         }
 
@@ -233,6 +233,7 @@ public sealed class Node : IAsyncDisposable
             _store.Set(request.Key!, request.Value);
             _appliedSeq.Advance(seq);
         }
+        _logger.LogInformation("{Node} [AppliedSeq={AppliedSeq}]: applied SET key={Key} seq={Seq}", Name, _appliedSeq.Value, request.Key, seq);
         return new WireMessage { Kind = WireKind.Response, Status = WireStatus.Ok, Seq = seq };
     }
 
@@ -240,7 +241,7 @@ public sealed class Node : IAsyncDisposable
     {
         if (Role != NodeRole.Primary)
         {
-            _logger.LogWarning("{Node}: rejected DEL for key {Key} - not primary", Name, request.Key);
+            _logger.LogWarning("{Node} [AppliedSeq={AppliedSeq}]: rejected DEL for key {Key} - not primary", Name, _appliedSeq.Value, request.Key);
             return new WireMessage { Kind = WireKind.Response, Status = WireStatus.NotPrimary };
         }
 
@@ -251,6 +252,7 @@ public sealed class Node : IAsyncDisposable
             _store.Delete(request.Key!);
             _appliedSeq.Advance(seq);
         }
+        _logger.LogInformation("{Node} [AppliedSeq={AppliedSeq}]: applied DEL key={Key} seq={Seq}", Name, _appliedSeq.Value, request.Key, seq);
         return new WireMessage { Kind = WireKind.Response, Status = WireStatus.Ok, Seq = seq };
     }
 
@@ -282,7 +284,7 @@ public sealed class Node : IAsyncDisposable
             {
                 conn.NoDelay = true;
                 var stream = conn.GetStream();
-                _logger.LogInformation("{Node}: accepted replication connection from {Endpoint}", Name, conn.Client.RemoteEndPoint);
+                _logger.LogInformation("{Node} [AppliedSeq={AppliedSeq}]: accepted replication connection from {Endpoint}", Name, _appliedSeq.Value, conn.Client.RemoteEndPoint);
 
                 // Tell the primary where we left off, so it knows what to (re)send. This is the
                 // one mechanism that makes "primary resends on reconnect" and "late-joining
@@ -291,7 +293,7 @@ public sealed class Node : IAsyncDisposable
                     stream,
                     new WireMessage { Kind = WireKind.Hello, Seq = _appliedSeq.Value },
                     ct).ConfigureAwait(false);
-                _logger.LogInformation("{Node}: sent HELLO reporting AppliedSeq={AppliedSeq}", Name, _appliedSeq.Value);
+                _logger.LogInformation("{Node} [AppliedSeq={AppliedSeq}]: sent HELLO reporting AppliedSeq={AppliedSeq}", Name, _appliedSeq.Value, _appliedSeq.Value);
 
                 while (!ct.IsCancellationRequested)
                 {
@@ -302,12 +304,12 @@ public sealed class Node : IAsyncDisposable
                     }
                     catch (InvalidDataException ex)
                     {
-                        _logger.LogWarning(ex, "{Node}: malformed frame on replication connection, dropping it", Name);
+                        _logger.LogWarning(ex, "{Node} [AppliedSeq={AppliedSeq}]: malformed frame on replication connection, dropping it", Name, _appliedSeq.Value);
                         return;
                     }
                     catch (IOException)
                     {
-                        _logger.LogWarning("{Node}: lost connection to primary, will re-HELLO on reconnect", Name);
+                        _logger.LogWarning("{Node} [AppliedSeq={AppliedSeq}]: lost connection to primary, will re-HELLO on reconnect", Name, _appliedSeq.Value);
                         return; // primary dropped - it will reconnect and we'll re-Hello then
                     }
                     if (msg is null) return;
@@ -329,9 +331,9 @@ public sealed class Node : IAsyncDisposable
             if (seq <= _appliedSeq.Value)
             {
                 _logger.LogWarning(
-                    "{Node}: skipped already-applied seq {Seq} (local AppliedSeq={AppliedSeq}) - " +
+                    "{Node} [AppliedSeq={AppliedSeq}]: skipped already-applied seq {Seq} - " +
                     "expected after a resend/reconnect, but also how the primary-restart seq-collision bug " +
-                    "in Design.md would manifest", Name, seq, _appliedSeq.Value);
+                    "in Design.md would manifest", Name, _appliedSeq.Value, seq);
                 return; // already applied - dedup after resend/reconnect (convergence requirement)
             }
 
@@ -341,6 +343,7 @@ public sealed class Node : IAsyncDisposable
                 _store.Delete(msg.Key!);
 
             _appliedSeq.Advance(seq);
+            _logger.LogInformation("{Node} [AppliedSeq={AppliedSeq}]: applied replicated {Op} key={Key} seq={Seq}", Name, _appliedSeq.Value, msg.Op, msg.Key, seq);
         }
     }
 
@@ -360,7 +363,7 @@ public sealed class Node : IAsyncDisposable
                 var hello = await WireCodec.ReadMessageAsync(stream, ct).ConfigureAwait(false)
                             ?? throw new IOException("Replica closed before Hello.");
                 long lastSent = hello.Seq ?? 0;
-                _logger.LogInformation("{Node}: connected to replica {Target}, resuming replication from seq {LastSent}", Name, target, lastSent);
+                _logger.LogInformation("{Node} [AppliedSeq={AppliedSeq}]: connected to replica {Target}, resuming replication from seq {LastSent}", Name, _appliedSeq.Value, target, lastSent);
 
                 while (!ct.IsCancellationRequested)
                 {
@@ -392,7 +395,7 @@ public sealed class Node : IAsyncDisposable
             {
                 // Connection refused / reset / EOF - replica is down or restarting.
                 // Back off briefly and retry; the next Hello tells us where to resume.
-                _logger.LogWarning(ex, "{Node}: lost connection to replica {Target}, retrying in {Delay}", Name, target, ReplicaReconnectDelay);
+                _logger.LogWarning(ex, "{Node} [AppliedSeq={AppliedSeq}]: lost connection to replica {Target}, retrying in {Delay}", Name, _appliedSeq.Value, target, ReplicaReconnectDelay);
                 try { await Task.Delay(ReplicaReconnectDelay, ct).ConfigureAwait(false); }
                 catch (OperationCanceledException) { return; }
             }
