@@ -350,6 +350,39 @@ different-sized reads. `MaxPayloadBytes` (1 MiB) is not "the length we expect" -
 a ceiling used only to reject unreasonable values; real payloads are almost always
 far smaller than it.
 
+## Alternatives to length-prefix framing
+
+Length-prefixing (what's implemented) is the common choice, but not the only one.
+
+**Delimiter-based framing** (e.g. newline-delimited JSON): read bytes until a
+delimiter, e.g. `\n`, is seen - that's the message boundary. Simpler to write by hand
+(no binary header) and readable over something like `telnet`. But it relies on the
+payload never containing a raw delimiter byte - true in practice for compactly
+serialized JSON (a real newline inside a string gets escaped as `\n`), but that's an
+assumption about the serializer's behavior, not a structural guarantee the framing
+itself enforces. Length-prefixing has no such assumption: the payload can be any
+bytes at all, JSON or not, and parsing can't be confused by its contents.
+
+**No explicit framing at all - self-delimiting parse.** JSON is structurally
+self-terminating (balanced `{}`/`[]`). A streaming parser (`Utf8JsonReader` in
+multi-segment mode) can be fed bytes as they arrive and will itself report once a
+complete top-level value has been read - no length or delimiter needed anywhere.
+Removes the header entirely, but moves "where does this message end" into the parser,
+and requires careful handling of partial multi-byte UTF-8 sequences across reads -
+meaningfully harder to get right than "read exactly N bytes."
+
+**Varint length prefix instead of a fixed 4 bytes** (what Protobuf/gRPC do
+internally): more compact on the wire for small messages, which most cache keys/
+values are. Not used here because the assignment explicitly waives compactness ("Any
+payload format is fine... We do not need a compact binary encoding"), and a fixed
+`Int32` header reads without a variable-width decoding loop - the byte savings don't
+matter on loopback traffic, and the extra complexity would buy nothing back.
+
+The chosen approach is the simplest one that has no assumptions about payload
+content: no dependency on the serializer never emitting a delimiter byte, no parser
+embedded in the framing layer, no variable-width decode loop - just "read 4 bytes,
+learn N, read N bytes."
+
 ## A garbage frame with a plausible length used to kill a connection silently
 
 Framing (above) only guards the *length* prefix. It says nothing about whether the
