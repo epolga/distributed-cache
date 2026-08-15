@@ -395,3 +395,183 @@ Fixing it here, at the one place both call sites already funnel through, means e
 existing `catch (IOException)` block now handles malformed JSON the same way it already
 handles a dropped connection - without touching `Node.cs` at all. No new exception type
 for callers to learn, no new catch clause to duplicate at every read site.
+
+## Why `WireMessage` is one flat DTO instead of several message types
+
+**Decision:** a single class with seven fields (`Kind`, `Op`, `Key`, `Value`, `Seq`,
+`MinSeq`, `Status`), all nullable except `Kind`. Which fields are meaningful depends on
+`Kind` - documented in the doc comment above the class, not enforced by the type
+system.
+
+**Alternative considered:** a type per message shape (`SetRequest`, `GetRequest`,
+`ReplicateMessage`, `HelloMessage`, ...), either as a polymorphic hierarchy with a JSON
+type discriminator, or as separate envelope/payload pairs.
+
+**Why flat:** at seven fields and six `Kind` values, a discriminator-based polymorphic
+setup would add a real amount of machinery - a base type, a type-discriminator
+attribute or manual envelope, a switch to pick the concrete type on deserialize - to
+save nothing at the call sites, which already switch on `Kind` either way
+(`HandleClientAsync`'s `request.Kind switch { ... }`). One type means one
+`JsonSerializer.Deserialize<WireMessage>` call everywhere, no polymorphic
+configuration to get wrong.
+
+**The honest cost:** every message carries fields it doesn't use - a `REPLICATE`
+message always has a null `Status`, a `GET` always has a null `Op`. At seven fields
+this is a non-issue; it's the kind of thing that stops being fine if the protocol grew
+many more `Kind` values each needing their own extra fields, since `WireMessage` would
+turn into a large bag of nullable fields whose valid combinations are documented only
+in a comment, not checked by the compiler.
+
+## Why `Node` is one role-based class instead of `PrimaryNode`/`ReplicaNode`
+
+**Decision:** one `Node` class with a `NodeRole Role` field, branching on it where
+behavior actually differs (constructor, `StartAsync`, `HandleSet`/`HandleDelete`'s
+`if (Role != NodeRole.Primary) return NotPrimary`). Primary-only state (`_log`,
+`_replicaTargets`) and replica-only state (`_replicationListener`) both live on the
+same class, just nullable/empty when not applicable to the current role.
+
+**Alternative considered:** `PrimaryNode`/`ReplicaNode` inheriting from a common base
+that holds the shared client-facing logic.
+
+**Why one class:** most of what `Node` does doesn't depend on role at all -
+`AcceptClientsLoopAsync`, `HandleClientAsync`, `HandleGetAsync`, `StartAsync`,
+`StopAsync`, `DisposeAsync` run identically either way. Only the replication side
+(inbound vs outbound) actually differs. Splitting by inheritance would leave two
+derived classes that are mostly empty, with nearly everything pulled up into the base
+- at that point the split isn't really doing anything except adding two extra types
+and a factory to pick between them. Since role is decided by `NodeConfig` at
+construction time, not by the compiler, something has to make that choice at runtime
+regardless of whether it's a class-selecting factory or a field check - the role field
+does the same job with less indirection.
+
+**The Liskov angle:** a `Replica extends Primary` (or the reverse) relationship
+wouldn't actually hold up. A Replica must reject `SET`/`DEL` with `NOT_PRIMARY` -
+it can't be freely substituted anywhere a Primary is expected, which is exactly what
+"extends" is supposed to promise. The real boundary being enforced here is a network
+protocol rule (who's allowed to write), not a type relationship - `Role` being checked
+inside `HandleSet`/`HandleDelete` reflects that directly instead of trying to encode a
+substitutability guarantee that doesn't actually exist.
+
+## Why `Get` is async but `Set`/`Del` are sync in `Node` - and all three are async in `CacheClient`
+
+**On `Node` (the server side):** `HandleGetAsync` is `async` because it can genuinely
+await something that takes time - `_appliedSeq.WaitForAsync(minSeq, ...)`, the
+read-your-writes wait, bounded by `ReadYourWritesTimeout` (3s). `HandleSet` and
+`HandleDelete` are plain synchronous methods: under `_applyLock`, they append to the
+in-memory `_log`, write to the in-memory `_store`, and advance a `SeqGate` - three
+in-memory operations, nothing to ever wait on. Making them `async` would add an
+`async` state machine around code that never actually suspends.
+
+**On `CacheClient` (the client side):** `SetAsync`, `DeleteAsync`, and `GetAsync` are
+all `async`, without exception, because every one of them goes through `SendAsync`,
+which does real I/O - write the request to a `NetworkStream`, then read the response
+back. The client never touches an in-memory store directly; there's no local-only case
+the way there is on the server. So the same "is there something to actually await"
+rule that splits `Node`'s three handlers two-sync/one-async lands on all-async on the
+client, because on that side, every operation is a network round trip.
+
+## `SendAsync`'s write-then-read, and why `HandleClientAsync`'s loop has no matching write first
+
+**`CacheClient.SendAsync`** writes the request and then reads exactly one response,
+every call:
+
+```csharp
+await WireCodec.WriteMessageAsync(stream, request, ct).ConfigureAwait(false);
+return await WireCodec.ReadMessageAsync(stream, ct).ConfigureAwait(false)
+       ?? throw new IOException("Connection closed before a response arrived.");
+```
+
+This is safe from cross-talk because `_sendLock` (a `SemaphoreSlim(1, 1)`) guarantees
+only one call is inside `SendAsync` at a time per connection - so the read right after
+a write can never accidentally consume a different call's response; there is only ever
+one request in flight to answer.
+
+**`Node.HandleClientAsync`'s loop reads first, with no write before it**, because the
+server side of this exchange is purely reactive - it never has anything to say until a
+request arrives. The very first thing that can happen on a freshly accepted client
+connection, from the server's point of view, is the client's request landing; there's
+nothing to write in advance of that.
+
+**Contrast with `HandleReplicationConnectionAsync`**, which *does* write first (its
+`HELLO`) before entering its read loop - because on that connection the accepting side
+(the Replica) is structurally the initiator of the handshake: it has to announce its
+`AppliedSeq` before there's anything meaningful for the Primary to send back. Same
+"write before read" question, opposite answer, because the two connections assign
+different roles to whoever happens to be the one accepting the socket.
+
+## Why the tests register disposal at construction (`await using var x = Create...(...)`)
+
+**Current pattern**, in every test:
+
+```csharp
+await using var replicaB = TestHarness.CreateReplica("B", out _, out int replPortB);
+await using var primary = TestHarness.CreatePrimary("A", out _, new ReplicaTarget("127.0.0.1", replPortB));
+```
+
+**Earlier pattern**, before this was changed: construct into a plain local first,
+register it for disposal on a separate line afterward - e.g. `var replicaB = TestHarness.CreateReplica(...); ...; await using var d1 = replicaB;`.
+
+**Why the change:** in the two-step version, there's a gap between "the node object
+exists" and "its disposal is guaranteed" - if constructing a *later* node threw (a
+port collision from `TestHarness.GetFreePort`, say) after an *earlier* node had already
+been constructed but before that earlier node's own `await using var d1 = ...` line had
+run, the earlier node would never get registered for disposal at all. It would leak -
+its `TcpListener` stays bound, its background accept loop keeps running - because the
+thrown exception unwinds straight past the line that would have protected it.
+Registering disposal in the same statement as construction (`await using var x = Create...`)
+removes that gap entirely: there's no window between "object exists" and "cleanup is
+guaranteed" for an exception to land in.
+
+## Can a third replica be added to a running Primary?
+
+**Not today, without a code change.** `NodeConfig.ReplicaTargets` is read once, in the
+constructor, into `_replicaTargets` - a plain `IReadOnlyList<ReplicaTarget>` with no
+mutator. `StartAsync` launches exactly one `ReplicaLinkLoopAsync` per target that
+existed at that moment:
+
+```csharp
+foreach (var target in _replicaTargets)
+    _backgroundTasks.Add(Task.Run(() => ReplicaLinkLoopAsync(target, ct), ct));
+```
+
+There's no method that adds to this list or starts an additional link loop after
+`StartAsync` has already run.
+
+**What's already handled vs. what's missing.** On the new replica's own side, nothing
+would need to change - the `HELLO`/catch-up mechanism already treats "a replica
+connects for the first time with `AppliedSeq: 0`" and "a replica reconnects after a
+drop" as the same code path (see the HELLO/REPLICATE section above), so a genuinely
+new replica joining mid-flight is already correctness-handled by the existing
+convergence logic. The only missing piece is entirely on the Primary side: something
+like an `AddReplicaAsync(ReplicaTarget)` method that appends to the target list and
+starts one more `ReplicaLinkLoopAsync` for it, callable while the Primary is already
+running.
+
+## Why `ApplyReplicatedEntry` treats "not Set" as "Del", and advances `Seq` either way
+
+```csharp
+if (msg.Op == WireOp.Set)
+    _store.Set(msg.Key!, msg.Value);
+else
+    _store.Delete(msg.Key!);
+
+_appliedSeq.Advance(seq);
+```
+
+**Why `else` instead of an explicit `== WireOp.Del` check:** `WireOp` only ever has two
+values, `Set` and `Del`. Every `REPLICATE` message a Replica receives was built by
+`ReplicaLinkLoopAsync` directly from a `ReplicationEntry`, and every `ReplicationEntry`
+was created by `_log.Append(...)`, called from exactly two places -
+`HandleSet` (`WireOp.Set`) and `HandleDelete` (`WireOp.Del`). There's no third value
+that can reach this method, so `else` is exhaustive in practice, not a shortcut taken
+at the cost of a missing case.
+
+**Why `Seq` advances on a delete too, not just a set:** `_appliedSeq` is exactly what a
+Replica's read-your-writes wait checks (`HandleGetAsync`'s
+`_appliedSeq.WaitForAsync(minSeq, ...)`). If a delete didn't advance it, a client that
+did `SET key` then `DEL key` then `GET key` with `minSeq` set to the delete's own `Seq`
+on a replica would wait out the full timeout - the delete would already be correctly
+applied to `_store`, but `minSeq` would never be considered "reached." Advancing
+`_appliedSeq` for every applied entry, not just sets, is what makes `minSeq` mean "this
+replica has processed everything up to and including operation N," rather than "up to
+and including the Nth *set*."
