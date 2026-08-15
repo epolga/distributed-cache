@@ -288,3 +288,64 @@ Primary reads it → Primary writes `REPLICATE` → Replica reads it - can't hav
 happen before the one before it, on either side, ever. Each connection also starts
 this sequence from scratch, so a previous (now-dead) connection's in-flight bytes
 can't leak into a new one either.
+
+## Why framing specifically, and where it's actually solved
+
+TCP is a byte stream, not a message stream - a single `Read()` is not guaranteed to
+return exactly what a single `Write()` sent. Data can arrive split across several
+reads, or several small writes can coalesce into one read. Assuming "one read = one
+message" is a classic, easy-to-make networking mistake.
+
+This is also the one requirement that would simply vanish if a higher-level transport
+(gRPC, SignalR, HTTP) were allowed - those handle framing invisibly. Using raw
+`TcpClient`/`Socket` is specifically what makes framing something to design at all,
+which is why it's called out on its own rather than folded into "implement the
+protocol."
+
+**Where it's solved - two distinct problems, two distinct fixes, both in
+`Protocol.cs`'s `Frame` class:**
+
+1. **Partial reads.** `ReadExactAsync` loops on `stream.ReadAsync`, accumulating into
+   a buffer until exactly the requested number of bytes has arrived, rather than
+   trusting a single call to return everything:
+
+   ```csharp
+   private static async Task<bool> ReadExactAsync(Stream stream, byte[] buffer, CancellationToken ct)
+   {
+       int offset = 0;
+       while (offset < buffer.Length)
+       {
+           int read = await stream.ReadAsync(buffer.AsMemory(offset), ct).ConfigureAwait(false);
+           if (read == 0)
+               return offset == 0 ? false : throw new EndOfStreamException("Connection closed mid-frame.");
+           offset += read;
+       }
+       return true;
+   }
+   ```
+
+   `read == 0` mid-way (some bytes already collected) means the connection died
+   inside a frame - a real error (`EndOfStreamException`), not a clean disconnect.
+
+2. **Malicious/corrupt length.** Checked immediately after parsing the header,
+   *before* allocating anything for the payload:
+
+   ```csharp
+   int length = BinaryPrimitives.ReadInt32BigEndian(header);
+   if (length < 0 || length > MaxPayloadBytes)
+       throw new InvalidDataException($"Frame length {length} out of bounds (max {MaxPayloadBytes}).");
+   var payload = new byte[length];
+   ```
+
+   Without this, a corrupted or hostile length value would drive `new byte[length]`
+   straight into an enormous (or, for a negative value, invalid) allocation before
+   anyone gets a chance to reject it.
+
+**One precision worth stating explicitly: the header and the payload behave
+differently with respect to "length."** The header is *always* exactly 4 bytes -
+that's fixed, because it's the size of the `Int32` length field itself, never
+anything else. The payload's length is *not* fixed or repeated - it's read fresh
+from each message's own header, so a tiny `GET` and a `SET` with a long value get
+different-sized reads. `MaxPayloadBytes` (1 MiB) is not "the length we expect" - it's
+a ceiling used only to reject unreasonable values; real payloads are almost always
+far smaller than it.
