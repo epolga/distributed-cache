@@ -737,10 +737,23 @@ write held `_applyLock`, nothing else could touch `_appliedSeq`, so at the exact
 instant `_appliedSeq.Advance(seq)` ran, `_appliedSeq.Value` *was* `seq` - reusing the
 local captures that fact for free, with no lock re-acquired and no extra read.
 
-**Why `ApplyReplicatedEntry`'s equivalent log line never had this bug:** its log call
-sits *inside* `lock (_applyLock)`, right after its own `_appliedSeq.Advance(seq)` -
-nothing else can advance `_appliedSeq` before that line runs, because doing so would
-require the same lock this thread is still holding. That was accidental correctness,
-not a deliberate choice at the time - the earlier logging section even lists doing I/O
-inside a lock as a minor style cost without noticing it was also the reason this
-particular line was safe.
+**Why `ApplyReplicatedEntry`'s equivalent log line never had this bug (at the time):**
+its log call sat *inside* `lock (_applyLock)`, right after its own
+`_appliedSeq.Advance(seq)` - nothing else could advance `_appliedSeq` before that line
+ran, because doing so would require the same lock this thread was still holding. That
+was accidental correctness, not a deliberate choice - the earlier logging section even
+lists doing I/O inside a lock as a minor style cost without noticing it was also the
+reason this particular line was safe.
+
+**Since fixed properly, not just left alone.** `ApplyReplicatedEntry` was refactored
+to get both properties at once - no I/O under the lock, and no race - the same way
+`HandleSet`/`HandleDelete` do: decide *inside* the lock (compute `seq`, check the
+dedup condition, capture `appliedSeqAtDecision = _appliedSeq.Value` for the skip case,
+apply the write if not skipped), then log *after* the lock closes, using only values
+already captured or already known-correct (`seq` for the success line, for the same
+reason as above; `appliedSeqAtDecision` - a local, not a fresh shared-state read - for
+the skip line). Verified the same way as the first fix: a throwaway script pushed
+1,000 writes from 20 concurrent clients through a Primary + one Replica and checked
+every "applied replicated" line - 0/1000 mismatches, and Primary/Replica `AppliedSeq`
+both landed on 1000, confirming the restructuring didn't change *what* gets applied,
+only when the logging happens relative to the lock.

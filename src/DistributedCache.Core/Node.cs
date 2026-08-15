@@ -330,25 +330,38 @@ public sealed class Node : IAsyncDisposable
 
     private void ApplyReplicatedEntry(WireMessage msg)
     {
+        long seq = msg.Seq!.Value;
+        bool skipped;
+        long appliedSeqAtDecision;
+
         lock (_applyLock)
         {
-            long seq = msg.Seq!.Value;
-            if (seq <= _appliedSeq.Value)
+            appliedSeqAtDecision = _appliedSeq.Value;
+            skipped = seq <= appliedSeqAtDecision;
+            if (!skipped)
             {
-                _logger.LogWarning(
-                    "{Node} [AppliedSeq={AppliedSeq}]: skipped already-applied seq {Seq} - " +
-                    "expected after a resend/reconnect, but also how the primary-restart seq-collision bug " +
-                    "in KeyDecisions.md would manifest", Name, _appliedSeq.Value, seq);
-                return; // already applied - dedup after resend/reconnect (convergence requirement)
+                if (msg.Op == WireOp.Set)
+                    _store.Set(msg.Key!, msg.Value);
+                else
+                    _store.Delete(msg.Key!);
+
+                _appliedSeq.Advance(seq); // dedup after resend/reconnect (convergence requirement)
             }
+        }
 
-            if (msg.Op == WireOp.Set)
-                _store.Set(msg.Key!, msg.Value);
-            else
-                _store.Delete(msg.Key!);
-
-            _appliedSeq.Advance(seq);
-            _logger.LogInformation("{Node} [AppliedSeq={AppliedSeq}]: applied replicated {Op} key={Key} seq={Seq}", Name, _appliedSeq.Value, msg.Op, msg.Key, seq);
+        // Logging moved outside the lock deliberately - see KeyDecisions.md. appliedSeqAtDecision
+        // was captured inside the lock, so it's race-free even though it's used out here; the
+        // success case reuses seq itself for the same reason HandleSet/HandleDelete do.
+        if (skipped)
+        {
+            _logger.LogWarning(
+                "{Node} [AppliedSeq={AppliedSeq}]: skipped already-applied seq {Seq} - " +
+                "expected after a resend/reconnect, but also how the primary-restart seq-collision bug " +
+                "in KeyDecisions.md would manifest", Name, appliedSeqAtDecision, seq);
+        }
+        else
+        {
+            _logger.LogInformation("{Node} [AppliedSeq={AppliedSeq}]: applied replicated {Op} key={Key} seq={Seq}", Name, seq, msg.Op, msg.Key, seq);
         }
     }
 
