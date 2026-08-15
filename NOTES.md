@@ -61,3 +61,35 @@ over "look at the live value," not a replacement for it.
 **When the event-driven version would be worth it:** if wait latency needed to be
 sub-millisecond, or if this were being polled by thousands of concurrent waiters where
 even a cheap poll's aggregate cost matters. Neither applies here.
+
+## `InMemoryStore` vs `ReplicationLog`: both grow unbounded today, but not for the same reason
+
+**Current state:** neither `_store` nor `_log` has any active mechanism limiting its
+size. `_store` only shrinks when a client explicitly sends `DEL` for a specific key -
+there's no TTL, no eviction, no bulk clear. `_log` never shrinks at all; it's
+append-only for the process's lifetime. Looked at purely as "does this grow forever
+today," they're equivalent.
+
+**Where they stop being equivalent: what it would take to fix each one.**
+
+For `_store`, a size-limiting policy (TTL, LRU eviction, whatever) would be a
+**local** decision - the store doesn't need to know anything about any other node's
+state to decide "this key hasn't been touched in a while, evict it." Nothing outside
+the store is affected by that decision.
+
+For `_log`, removing an old entry is **not** a safe local decision. If an entry gets
+trimmed before every replica has actually received and applied it - say a replica is
+currently disconnected, or just slow - that replica has no way to ever get that entry
+back. Its next `HELLO`+`From(afterSeq)` catch-up would silently skip straight past the
+gap, and convergence breaks: the replica would never end up in the same state as the
+Primary, with no error or signal that anything went wrong.
+
+**What `_log` would actually need first, before any trimming policy could be added
+safely:** a way for the Primary to know, for every replica, how far it has actually
+applied - which doesn't exist today. The only thing a replica currently tells the
+Primary is its `AppliedSeq` once, in `HELLO`, at connection time; there's no ongoing
+acknowledgment while the connection is live. Only once the Primary can compute "the
+minimum applied Seq across all currently-live replicas" would it be safe to trim
+`_log` up to that point. So for `_store`, what's missing is just a policy. For `_log`,
+what's missing is a whole communication channel (replica -> primary ACKs) that the
+policy would sit on top of - trimming is the easy part once that exists.
