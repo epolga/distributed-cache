@@ -757,3 +757,79 @@ the skip line). Verified the same way as the first fix: a throwaway script pushe
 every "applied replicated" line - 0/1000 mismatches, and Primary/Replica `AppliedSeq`
 both landed on 1000, confirming the restructuring didn't change *what* gets applied,
 only when the logging happens relative to the lock.
+
+## A second real bug: missing required fields crashed the same way `JsonException` did
+
+The `JsonException` fix (above) closes one way to send garbage: syntactically invalid
+JSON. It does nothing about syntactically *valid* JSON that's missing a field the
+handler assumes is there. `WireMessage`'s fields are all nullable except `Kind`, so
+`{"Kind":"GET"}` (no `"key"`) deserializes without error and reaches `HandleGetAsync`,
+where `_store.TryGet(request.Key!, out var value)` used the null-forgiving `!` on a
+value that can genuinely be null on the wire. `ConcurrentDictionary.TryGetValue(null, ...)`
+throws `ArgumentNullException` - uncaught by either `catch` clause on
+`HandleClientAsync`, an unobserved exception on a fire-and-forget task, connection
+dropped with **no response at all**. Same shape as the `JsonException` gap, different
+trigger. The same `!` pattern existed in `HandleSet`, `HandleDelete` (`request.Key!`)
+and `ApplyReplicatedEntry` (`msg.Seq!.Value`, `msg.Key!`) - all reachable the same way,
+since nothing authenticates who connects to either the client port or the replication
+port (out of scope per the assignment, but it means "send whatever JSON you want" is
+the actual threat model to design against, not an edge case).
+
+**Confirmed live**, not just by reading the code: a raw `TcpClient` (bypassing
+`CacheClient`, which always sets `Key`) sent a hand-built frame with
+`{"Kind":"GET"}` straight to a running Primary. Hooked
+`TaskScheduler.UnobservedTaskException` to make the otherwise-invisible failure
+visible:
+
+```
+Sent GET with no 'key' field. Waiting up to 2s for a response...
+Connection closed with NO response (0 bytes read).
+*** UNOBSERVED TASK EXCEPTION: ArgumentNullException: Value cannot be null. (Parameter 'key')
+Node still answers normal requests: SET succeeded, seq=1
+```
+
+The node itself survives (each connection is an isolated fire-and-forget task), but
+that specific connection dies with zero information for whoever sent the request.
+
+**Fix:** validate before dispatching, not deep inside the handler that assumes
+validity. In `HandleClientAsync`, `GET`/`SET`/`DEL` with a null `Key` now short-circuits
+to a logged `WireStatus.Error` response before reaching `HandleGetAsync`/`HandleSet`/
+`HandleDelete` at all. In `ApplyReplicatedEntry`, a `REPLICATE` missing `Seq` or `Key`
+is logged and dropped instead of dereferencing a null. Re-ran the same raw-socket
+experiment after the fix:
+
+```
+Sent GET with no 'key' field. Waiting up to 2s for a response...
+Got a response: {"kind":"RESPONSE","op":null,"key":null,"value":null,"seq":null,"minSeq":null,"status":"ERROR"}
+Node still answers normal requests: SET succeeded, seq=1
+```
+
+A real `ERROR` response instead of silence, and no unobserved exception.
+
+## A third finding, not yet fixed: `SeqGate.WaitForAsync` measures its timeout with `DateTime.UtcNow`
+
+```csharp
+var deadline = DateTime.UtcNow + timeout;
+while (true)
+{
+    var remaining = deadline - DateTime.UtcNow;
+    ...
+}
+```
+
+`DateTime.UtcNow` is wall-clock time - it can jump if the OS clock is corrected (NTP
+sync, manual change, VM host time-sync). `Stopwatch`/`Environment.TickCount64` are
+backed by a monotonic timer that elapsed-time measurement is supposed to use
+specifically because it can't jump. A backward clock correction mid-wait would make
+`remaining` balloon, extending a supposed-3-second `ReadYourWrites` timeout far past
+3 seconds; a forward correction would cut it short. This is the same "don't trust a
+clock" theme as the cross-node logging decision above, just for local elapsed-time
+measurement instead of cross-machine ordering - a different failure mode, same root
+mistake of asking a wall clock a question only a monotonic timer can safely answer.
+
+Not fixed yet, and not verified live - reproducing it would mean actually adjusting
+the system clock mid-test, which isn't something to do to a real machine to prove a
+point. Practical exposure here is low (fixed loopback topology, short-lived process,
+timeouts measured in seconds not hours), but the fix is a small, well-known one:
+replace the `DateTime.UtcNow` arithmetic with a `Stopwatch` measuring elapsed time
+against `timeout` directly.

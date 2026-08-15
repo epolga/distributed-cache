@@ -180,13 +180,31 @@ public sealed class Node : IAsyncDisposable
                     }
                     if (request is null) return; // clean disconnect
 
-                    WireMessage response = request.Kind switch
+                    WireMessage response;
+                    bool needsKey = request.Kind is WireKind.Get or WireKind.Set or WireKind.Del;
+                    if (needsKey && request.Key is null)
                     {
-                        WireKind.Get => await HandleGetAsync(request, ct).ConfigureAwait(false),
-                        WireKind.Set => HandleSet(request),
-                        WireKind.Del => HandleDelete(request),
-                        _ => new WireMessage { Kind = WireKind.Response, Status = WireStatus.Error }
-                    };
+                        // A syntactically valid message missing a semantically required field
+                        // (e.g. {"Kind":"GET"} with no "key") deserializes fine - WireMessage's
+                        // fields are all nullable - so it reaches here instead of failing in
+                        // WireCodec. Without this check, request.Key! below would throw
+                        // ArgumentNullException from inside ConcurrentDictionary, uncaught by
+                        // either catch clause on this method, silently killing the connection -
+                        // the same failure shape as the JsonException gap, different cause. See
+                        // KeyDecisions.md.
+                        _logger.LogWarning("{Node} [AppliedSeq={AppliedSeq}]: rejected {Kind} with missing key from {Endpoint}", Name, _appliedSeq.Value, request.Kind, client.Client.RemoteEndPoint);
+                        response = new WireMessage { Kind = WireKind.Response, Status = WireStatus.Error };
+                    }
+                    else
+                    {
+                        response = request.Kind switch
+                        {
+                            WireKind.Get => await HandleGetAsync(request, ct).ConfigureAwait(false),
+                            WireKind.Set => HandleSet(request),
+                            WireKind.Del => HandleDelete(request),
+                            _ => new WireMessage { Kind = WireKind.Response, Status = WireStatus.Error }
+                        };
+                    }
 
                     await WireCodec.WriteMessageAsync(stream, response, ct).ConfigureAwait(false);
                 }
@@ -330,7 +348,15 @@ public sealed class Node : IAsyncDisposable
 
     private void ApplyReplicatedEntry(WireMessage msg)
     {
-        long seq = msg.Seq!.Value;
+        if (msg.Seq is not long seq || msg.Key is null)
+        {
+            // Same class of gap as HandleClientAsync's missing-key check: a REPLICATE message
+            // missing Seq or Key is valid JSON but can't be applied. Only reachable via a raw
+            // connection to the replication port (this node only ever constructs REPLICATE
+            // messages with both fields itself), but nothing stops that on this network.
+            _logger.LogWarning("{Node} [AppliedSeq={AppliedSeq}]: dropped malformed REPLICATE (missing seq or key)", Name, _appliedSeq.Value);
+            return;
+        }
         bool skipped;
         long appliedSeqAtDecision;
 
