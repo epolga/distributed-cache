@@ -122,3 +122,52 @@ last read. The Primary sees every write (it's the only writer), but it has no
 visibility into `GET`s served directly by a Replica - a read-based TTL would need the
 Replicas to report access back to the Primary, which is a different, unbuilt channel.
 Write-based TTL needs nothing new beyond what's described above.
+
+## What happens if the Primary itself restarts
+
+Nothing about the Primary survives a restart either - `_log`, `_store`, and
+`_appliedSeq` are all in-memory only, same as everywhere else in this system. A fresh
+`Node` starts with an empty log, an empty store, and `_appliedSeq = 0`. Replicas that
+were already running keep whatever they had applied before the crash - they don't
+lose anything themselves, since they didn't restart.
+
+**This isn't just "replicas are now stale" - it's a concrete, reproducible correctness
+bug via `Seq` collision.** When a Replica with, say, `AppliedSeq = 500` reconnects and
+sends `HELLO{AppliedSeq: 500}`, the new Primary's `_log.From(500)` looks at its own
+(empty) history:
+
+```csharp
+public IReadOnlyList<ReplicationEntry> From(long afterSeq)
+{
+    if (afterSeq >= _entries.Count) return Array.Empty<ReplicationEntry>();
+    ...
+}
+```
+
+`_entries.Count` is `0`, so `500 >= 0` is true, and it returns nothing - the new
+Primary concludes "you're already caught up," when in reality it just has no history
+at all, old or new.
+
+The new Primary then starts accepting fresh writes and numbering them **from 1
+again**. Those `REPLICATE` messages (`Seq = 1, 2, 3...`) reach the Replica, whose
+dedup check sees:
+
+```csharp
+if (seq <= _appliedSeq.Value) return; // "already applied" - silently skipped
+```
+
+`1 <= 500` is true, so the Replica silently discards every new write from the
+restarted Primary, genuinely believing it has already applied them - when in fact
+these are entirely new writes that happen to carry Seq numbers from a range the
+Replica already passed through in a *previous* incarnation of the Primary. The
+Replica doesn't just lag; it permanently stops receiving new data after a Primary
+restart, with no error anywhere.
+
+**What a real fix would need:** `Seq` alone isn't enough to survive a Primary
+restart - it needs to be paired with something that changes every time a new Primary
+process starts (an "epoch" or "generation" number), so a fresh Primary's `Seq=1` can
+never collide with a previous incarnation's `Seq=1` in a Replica's eyes. That epoch
+value would itself need to come from somewhere durable across the Primary's own
+restart (persisted to disk, or derived from wall-clock time at startup) - which loops
+back to the same root cause as everything else in this file: nothing in this system
+survives a process restart, anywhere.
