@@ -866,3 +866,49 @@ point. Practical exposure here is low (fixed loopback topology, short-lived proc
 timeouts measured in seconds not hours), but the fix is a small, well-known one:
 replace the `DateTime.UtcNow` arithmetic with a `Stopwatch` measuring elapsed time
 against `timeout` directly.
+
+## Three more architectural alternatives worth naming
+
+**Pull-based replication instead of push.** `ReplicaLinkLoopAsync` has the Primary
+actively connect *out* to each configured `ReplicaTarget` and push `REPLICATE`
+messages. The inverse is a pull model: each Replica periodically (or via long-poll)
+connects to the Primary and asks "everything after my `AppliedSeq`," and the Primary
+stays a passive listener with no knowledge of who its replicas even are. This flips
+which side owns reconnect/retry logic - in the current push design that's
+`ReplicaLinkLoopAsync` on the Primary; in a pull design it would move to each
+Replica's own connect loop, and the Primary's `ReplicaTargets` config would disappear
+entirely (a replica just needs to know the Primary's address, not the reverse). Kafka
+consumers pull; MySQL's binlog replication pushes - both are real, common choices.
+Push was more natural here mainly because the Primary already owns `ReplicationLog`
+and the convergence logic built around `_log.From(afterSeq)`; a pull model would need
+that same logic exposed as something a Replica calls into remotely instead of the
+Primary calling it locally.
+
+**`minSeq` supplied by the client vs. a server-tracked session.** `CacheClient.GetAsync`
+takes an explicit `minSeq` that the caller must remember and pass itself - the node
+holds no state about which client last wrote what. The alternative is a
+causal-consistency-style session (as MongoDB's client sessions do): the server
+associates a "last written Seq" with a session/connection identity and automatically
+applies the read-your-writes wait on that session's future reads, with no `minSeq`
+parameter needed at all. That would move bookkeeping from every caller into the node
+itself - simpler to *use* correctly (nothing to forget to pass), but it adds session
+state and a lifetime/expiry question (how long does a session's last-seq stick around,
+what happens if the same logical client reconnects as a new session) that the current
+stateless-per-request design has no need to answer. The explicit-`minSeq` design was
+chosen because it's the smaller amount of new machinery given `Seq` already existed as
+something `SetAsync`/`DeleteAsync` return - session tracking would be built on top of
+that, not instead of it.
+
+**Passive (reactive) failure detection vs. an active heartbeat.** `ReplicaLinkLoopAsync`
+only learns a replica is unreachable when a `WriteAsync` or the `HELLO` read actually
+throws - there's no periodic ping independent of real traffic. Worse, TCP keepalive
+is never enabled on any socket here (`Socket.SetSocketOption(..., KeepAlive, true)` is
+never called), so a true network partition - not a clean FIN, just silence - might not
+surface as an exception until the OS's own TCP retransmission timeout gives up, which
+defaults to well over a minute on most platforms, not the ~300ms
+`ReplicaReconnectDelay` the retry loop assumes it'll be reacting on. An active
+heartbeat (a small `PING`/`PONG` message exchanged on a fixed interval, independent of
+whether there's real data to replicate) would surface a truly silent partition far
+faster and more predictably. Unlike the other two items in this section, this isn't a
+tradeoff with a real upside to the current choice - it's a gap: the current design
+just never added a liveness check beyond "did the last actual operation fail."
