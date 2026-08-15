@@ -698,3 +698,49 @@ failures are worth a line. A real captured line, same run as above:
 14:51:08.100 info: DistributedCache.Core.CacheClient[0] 127.0.0.1:6000: connected
 14:51:08.101 info: DistributedCache.Core.CacheClient[0] 127.0.0.1:6000: SET key=users/1 seq=1
 ```
+
+## A real bug: `HandleSet`/`HandleDelete` could log a wrong ambient `AppliedSeq`
+
+The section above claims the ambient `AppliedSeq` and the event's own `Seq` always
+coincide on a write's own log line, "because `_appliedSeq.Advance(seq)` runs in the
+same locked block as the write itself." That reasoning is correct about the *write* -
+wrong about the *log line*, because the log call was placed **after** `lock (_applyLock)`
+had already been released:
+
+```csharp
+lock (_applyLock)
+{
+    seq = _log!.Append(WireOp.Set, request.Key!, request.Value);
+    _store.Set(request.Key!, request.Value);
+    _appliedSeq.Advance(seq);
+}
+_logger.LogInformation("... [AppliedSeq={AppliedSeq}]: applied SET key={Key} seq={Seq}", Name, _appliedSeq.Value, request.Key, seq);
+```
+
+Between releasing the lock and this line actually reading `_appliedSeq.Value`, a
+*different* concurrent client connection can win the lock, apply its own write, and
+advance `_appliedSeq` further. This write's own log line then reports an ambient
+`AppliedSeq` that's already ahead of its own `seq` - not wrong data (the store and
+replication are unaffected; only this log line's ambient field is stale-in-the-other-
+direction), but a direct contradiction of the invariant this file claims.
+
+**Confirmed empirically**, not just by reading the code: a throwaway script (20
+concurrent writers × 50 writes each, a capturing `ILogger`, checked every "applied
+SET" line for `AppliedSeq != seq`) found 12 mismatches out of 1000 lines before the
+fix, e.g. `A [AppliedSeq=58]: applied SET key=w4/k5 seq=57` - writer B's seq-58 write
+landed in the gap between writer A releasing the lock and A's own log line reading
+`_appliedSeq.Value`. Three repeats after the fix: 0 mismatches out of 1000 each time.
+
+**Fix:** log `seq` itself for the ambient field too, instead of re-reading
+`_appliedSeq.Value`. This is provably correct, not a weaker approximation: while this
+write held `_applyLock`, nothing else could touch `_appliedSeq`, so at the exact
+instant `_appliedSeq.Advance(seq)` ran, `_appliedSeq.Value` *was* `seq` - reusing the
+local captures that fact for free, with no lock re-acquired and no extra read.
+
+**Why `ApplyReplicatedEntry`'s equivalent log line never had this bug:** its log call
+sits *inside* `lock (_applyLock)`, right after its own `_appliedSeq.Advance(seq)` -
+nothing else can advance `_appliedSeq` before that line runs, because doing so would
+require the same lock this thread is still holding. That was accidental correctness,
+not a deliberate choice at the time - the earlier logging section even lists doing I/O
+inside a lock as a minor style cost without noticing it was also the reason this
+particular line was safe.

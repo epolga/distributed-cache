@@ -233,7 +233,11 @@ public sealed class Node : IAsyncDisposable
             _store.Set(request.Key!, request.Value);
             _appliedSeq.Advance(seq);
         }
-        _logger.LogInformation("{Node} [AppliedSeq={AppliedSeq}]: applied SET key={Key} seq={Seq}", Name, _appliedSeq.Value, request.Key, seq);
+        // Log seq itself for the ambient field too, not a fresh _appliedSeq.Value read - a
+        // concurrent writer can advance AppliedSeq between releasing the lock above and this
+        // line running, which would make the two numbers on this line disagree even though
+        // this write's own AppliedSeq, at the instant it was applied, was exactly seq.
+        _logger.LogInformation("{Node} [AppliedSeq={AppliedSeq}]: applied SET key={Key} seq={Seq}", Name, seq, request.Key, seq);
         return new WireMessage { Kind = WireKind.Response, Status = WireStatus.Ok, Seq = seq };
     }
 
@@ -252,7 +256,8 @@ public sealed class Node : IAsyncDisposable
             _store.Delete(request.Key!);
             _appliedSeq.Advance(seq);
         }
-        _logger.LogInformation("{Node} [AppliedSeq={AppliedSeq}]: applied DEL key={Key} seq={Seq}", Name, _appliedSeq.Value, request.Key, seq);
+        // Same reasoning as HandleSet: use seq itself, not a post-lock _appliedSeq.Value read.
+        _logger.LogInformation("{Node} [AppliedSeq={AppliedSeq}]: applied DEL key={Key} seq={Seq}", Name, seq, request.Key, seq);
         return new WireMessage { Kind = WireKind.Response, Status = WireStatus.Ok, Seq = seq };
     }
 
