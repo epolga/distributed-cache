@@ -93,3 +93,32 @@ minimum applied Seq across all currently-live replicas" would it be safe to trim
 `_log` up to that point. So for `_store`, what's missing is just a policy. For `_log`,
 what's missing is a whole communication channel (replica -> primary ACKs) that the
 policy would sit on top of - trimming is the easy part once that exists.
+
+### `_store` is the thing that actually gets replicated; `_log` never is
+
+Worth stating plainly: `_store` is duplicated across nodes - that's the entire point
+of replication. Primary applies a write to its own `_store`, records it in `_log`,
+and streams it out; each Replica applies the same write to its *own*, separate
+`InMemoryStore` instance via `ApplyReplicatedEntry`. The three nodes end up with three
+independent `_store` objects that converge to the same contents. `_log`, by contrast,
+is never copied anywhere - only the Primary ever has one (see the Node.cs role split:
+`_log` is Primary-only, `_replicationListener` is Replica-only).
+
+**Does `_store` being duplicated reintroduce the same coordination problem discussed
+above, if a size-limiting policy were added to it?** Not if the policy lives only on
+the Primary and evicts by sending an ordinary `DEL` through the existing replication
+path, rather than having each node decide independently. Eviction then becomes just
+another write flowing through the already-proven `_log`/`REPLICATE` pipe -
+`_log.Append(WireOp.Del, ...)`, `_store.Delete(...)`, `_appliedSeq.Advance(...)`, the
+same internals `HandleDelete` already uses, just triggered by a timer instead of a
+client request. No new protocol, no new message type, no per-node coordination logic -
+only a new *initiator* of an operation that already exists and is already replicated
+correctly. The only residual lag is the same ordinary replication lag every write
+already has (closeable with `minSeq` if it ever mattered for an evicted key, which it
+wouldn't).
+
+One real design choice this forces: TTL should be measured from **last write**, not
+last read. The Primary sees every write (it's the only writer), but it has no
+visibility into `GET`s served directly by a Replica - a read-based TTL would need the
+Replicas to report access back to the Primary, which is a different, unbuilt channel.
+Write-based TTL needs nothing new beyond what's described above.
