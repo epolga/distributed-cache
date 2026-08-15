@@ -171,3 +171,50 @@ value would itself need to come from somewhere durable across the Primary's own
 restart (persisted to disk, or derived from wall-clock time at startup) - which loops
 back to the same root cause as everything else in this file: nothing in this system
 survives a process restart, anywhere.
+
+## Walking `ReadYourWrites_GetOnReplicaWithMinSeq_NeverObservesStaleValue` end to end
+
+Worth having one full trace written down, since this test is where every piece
+(`Node`, `SeqGate`, `ReplicationLog`, `CacheClient`) actually meets in one place.
+
+**Setup.** `replicaB` and `primary` (with `replicaB` as its one `ReplicaTarget`) are
+constructed, then started. Starting `replicaB` launches its client-accept loop and
+`AcceptReplicationLoopAsync`. Starting `primary` launches its client-accept loop and,
+because `_replicaTargets` is non-empty this time (unlike the happy-path test),
+`ReplicaLinkLoopAsync(target)`. That loop connects to `replicaB`'s replication port,
+reads its `HELLO{AppliedSeq: 0}`, finds nothing to send yet (the log is empty), and
+parks on `WaitForMoreAsync`. The `Task.Delay(200)` right after just gives that
+handshake time to finish before the measured loop starts - it isn't part of the
+guarantee being tested.
+
+**One iteration of the loop, in full:**
+
+1. `writer.SetAsync(key, val)` sends `SET` to Primary. `HandleSet` runs under
+   `_applyLock`: `_log.Append` assigns `seq` and advances `_appendedGate`;
+   `_store.Set` writes the value; `_appliedSeq.Advance(seq)` advances Primary's own
+   gate. The response (with `Seq`) goes back to `writer`.
+2. In the background, the moment `_appendedGate` advanced, the parked
+   `ReplicaLinkLoopAsync` wakes, reads the new entry via `_log.From(...)`, and sends
+   it to `replicaB` as a `REPLICATE` message.
+3. `reader.GetAsync(key, minSeq: seq)` sends `GET` to `replicaB` with that same `seq`
+   as `MinSeq`. `HandleGetAsync` sees `MinSeq` is set and calls
+   `_appliedSeq.WaitForAsync(seq, ...)` - on the Replica's *own* gate this time, not
+   Primary's.
+4. Two possible timings here, both correct: if `replicaB`'s own
+   `HandleReplicationConnectionAsync` loop already read and applied the `REPLICATE`
+   message (via `ApplyReplicatedEntry`, which advances Replica's `_appliedSeq`) by
+   the time `WaitForAsync` checks, it returns `true` immediately - no wait. If not,
+   `WaitForAsync` polls (every 20ms) until that same `Advance` call satisfies it.
+   Either way, once it returns, `_store.TryGet` is guaranteed to find the value,
+   because the wait specifically guaranteed the write was already applied before the
+   read happened.
+5. Both assertions (`found`, and the value matches) pass as a direct consequence of
+   step 4 - not because of timing luck.
+
+**Why the loop runs 50 times with no sleep between write and read:** if the
+`minSeq` wait were broken (a missing `await`, a race in `_applyLock`, whatever), it
+would only fail *intermittently* - exactly when the replica happens not to have
+caught up on its own by chance. A single iteration could easily pass by accident.
+Fifty consecutive iterations, with no artificial delay giving replication extra time
+to "naturally" catch up, make a broken guarantee show up reliably instead of
+sometimes.
