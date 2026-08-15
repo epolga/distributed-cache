@@ -575,3 +575,73 @@ applied to `_store`, but `minSeq` would never be considered "reached." Advancing
 `_appliedSeq` for every applied entry, not just sets, is what makes `minSeq` mean "this
 replica has processed everything up to and including operation N," rather than "up to
 and including the Nth *set*."
+
+## Logging: `ILogger<Node>`, added because "caught" isn't "visible"
+
+**Motivation.** Before this, every error path in `Node.cs` was either silent
+(`catch (IOException) { /* peer gone */ }`) or, worse, actively swallowed an exception
+type nobody would think to look for. The JsonException fix above is the concrete
+example: it made a malformed frame get *caught* correctly, but nothing about that fix
+made it *visible* - on three separate real machines, a node could drop connections
+indefinitely and there would be nothing anywhere to look at.
+
+**Decision:** `Node` takes an optional `ILogger<Node>? logger = null` in its
+constructor, defaulting to `NullLogger<Node>.Instance` when not supplied - so every
+existing construction site (`TestHarness`, the old `Program.cs`) keeps compiling and
+running exactly as before, silently, unless a real logger is explicitly wired in.
+`DistributedCache.Core` only takes a dependency on
+`Microsoft.Extensions.Logging.Abstractions` (interfaces + `NullLogger`, no concrete
+provider) - `DistributedCache.App` is the one that references
+`Microsoft.Extensions.Logging.Console` and actually constructs a console logger, since
+deciding *where* logs go is a composition-root concern, not a library concern.
+
+**Every message includes the node's own name** (`Name`, the same field passed as
+`NodeConfig.Name`) as the first structured parameter, since on three real machines the
+log lines from all three nodes could easily end up interleaved in one place (a shared
+log aggregator, or even just three terminals scrolled together) - without the name, a
+line like "lost connection to replica" wouldn't say whose replica. A real line from the
+demo:
+
+```
+info: DistributedCache.Core.Node[0]
+      A: connected to replica ReplicaTarget { Host = 127.0.0.1, Port = 6101 }, resuming replication from seq 0
+```
+
+**What's logged, and at what level:**
+
+| Where | Level | What |
+|---|---|---|
+| `StartAsync`/`StopAsync` | Information | role, ports, stop |
+| `HandleClientAsync` read - malformed frame | Warning | includes the client's remote endpoint and the exception |
+| `HandleClientAsync` read - clean disconnect | Debug | routine, not an error |
+| `HandleSet`/`HandleDelete` - `NOT_PRIMARY` | Warning | a client wrote to the wrong node |
+| `HandleGetAsync` - `STALE_TIMEOUT` | Warning | a replica didn't catch up to `minSeq` in time |
+| `HandleReplicationConnectionAsync` - accept, HELLO sent | Information | |
+| `HandleReplicationConnectionAsync` - malformed frame / lost primary | Warning | |
+| `ApplyReplicatedEntry` - dedup skip (`seq <= AppliedSeq`) | Warning | see below |
+| `ReplicaLinkLoopAsync` - connected, resuming from seq N | Information | |
+| `ReplicaLinkLoopAsync` - lost replica, retrying | Warning | includes the exception |
+
+**Why the dedup-skip in `ApplyReplicatedEntry` is Warning, not Debug:** this is the
+exact code path where the documented Primary-restart Seq-collision bug (above) would
+show up in practice - a replica silently discarding writes it actually needs, while
+believing they're duplicates. Under normal operation (a genuine resend after a replica
+reconnect) this line firing once or twice is expected and harmless. But if it starts
+firing *continuously* after a Primary restart, that's the bug from this same file
+manifesting live - Warning, not Debug, so it isn't lost in routine noise, and the log
+message says so directly rather than making the reader re-derive it.
+
+**Demo wiring**, in `DistributedCache.App/Program.cs`:
+
+```csharp
+using var loggerFactory = LoggerFactory.Create(builder => builder
+    .AddSimpleConsole(o => o.SingleLine = true)
+    .SetMinimumLevel(LogLevel.Information));
+
+var replicaB = new Node(new NodeConfig { ... }, loggerFactory.CreateLogger<Node>());
+```
+
+Running the demo now prints, in order: each node starting, the replication handshake
+(accept → HELLO sent → primary resumes from the reported seq) for both replicas, and
+each node stopping - all three nodes' lines distinguishable by name even though
+they're interleaved in one console.

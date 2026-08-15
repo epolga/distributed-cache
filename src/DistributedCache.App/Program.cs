@@ -1,17 +1,22 @@
 using DistributedCache.Core;
+using Microsoft.Extensions.Logging;
 
 // Manual smoke-test / demo: spins up a 3-node cluster on loopback in a single process
 // and exercises the primary write-path + read-your-writes.
 
-var replicaB = new Node(new NodeConfig { Name = "B", Role = NodeRole.Replica, ClientPort = 6001, ReplicationPort = 6101 });
-var replicaC = new Node(new NodeConfig { Name = "C", Role = NodeRole.Replica, ClientPort = 6002, ReplicationPort = 6102 });
+using var loggerFactory = LoggerFactory.Create(builder => builder
+    .AddSimpleConsole(o => o.SingleLine = true)
+    .SetMinimumLevel(LogLevel.Information));
+
+var replicaB = new Node(new NodeConfig { Name = "B", Role = NodeRole.Replica, ClientPort = 6001, ReplicationPort = 6101 }, loggerFactory.CreateLogger<Node>());
+var replicaC = new Node(new NodeConfig { Name = "C", Role = NodeRole.Replica, ClientPort = 6002, ReplicationPort = 6102 }, loggerFactory.CreateLogger<Node>());
 var primary = new Node(new NodeConfig
 {
     Name = "A",
     Role = NodeRole.Primary,
     ClientPort = 6000,
     ReplicaTargets = new[] { new ReplicaTarget("127.0.0.1", 6101), new ReplicaTarget("127.0.0.1", 6102) }
-});
+}, loggerFactory.CreateLogger<Node>());
 
 await replicaB.StartAsync();
 await replicaC.StartAsync();
