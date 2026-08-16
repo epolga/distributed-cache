@@ -7,9 +7,8 @@ primary↔replica traffic, length-prefixed on the wire (4-byte big-endian length
 JSON payload — see `Protocol.cs`). `Kind` selects meaning: `SET`/`DEL`/`GET` are client
 requests, `RESPONSE` is the reply, `HELLO` is a replica announcing its last applied
 sequence number when a replication connection opens, `REPLICATE` is one applied write
-streamed from primary to replica. A single DTO was chosen over polymorphic
-deserialization because the assignment explicitly doesn't require a compact/typed wire
-format, and it keeps the codec to ~15 lines.
+streamed from primary to replica (rationale for one flat type over polymorphic
+deserialization in `KeyDecisions.md`).
 
 Every write (`SET`/`DEL`) applied on the Primary is assigned a strictly increasing
 `Seq` (a per-primary counter, not per-key). That sequence number is the backbone of
@@ -24,9 +23,10 @@ both guarantees below.
   its own write. A client that does **not** pass `minSeq` gets whatever that node has
   applied so far — possibly stale on a replica that hasn't caught up yet, and there is
   no way to distinguish "stale" from "never written" in that mode.
-- **No cross-client ordering guarantee.** If client X writes and client Y — who never
-  learned X's `Seq` — reads a replica, Y can still see the old value. The guarantee is
-  per-writer, not cluster-wide monotonic reads.
+- **No cross-client ordering guarantee.** The guarantee is keyed on `Seq`, not client
+  identity — anyone holding a `Seq` gets read-your-writes for it, whether or not they
+  wrote it themselves. In practice this is per-writer only because a client doesn't
+  normally learn another client's `Seq`.
 - **A write acknowledged by the Primary is durable only in memory.** No fsync, no disk
   log. If the Primary process dies, acknowledged writes not yet replicated are gone
   (see "left out" below).
