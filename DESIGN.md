@@ -81,6 +81,10 @@ If a `ReplicaLink`'s TCP connection throws (refused, reset, EOF), the loop backs
 3-node topology with no failover — a permanently dead replica just never catches up,
 which is an accepted simplification, not a monitored/alerted condition).
 
+Beyond what the assignment asks for, `Node`/`CacheClient` also take an optional
+`ILogger` (default no-op) — the retries and drops described above, and applied writes,
+are logged rather than silent; rationale in `KeyDecisions.md`.
+
 ## What was deliberately left out
 
 - **No persistence.** The replication log lives only in the Primary's memory; a Primary
