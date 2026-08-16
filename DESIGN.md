@@ -15,30 +15,6 @@ Every write (`SET`/`DEL`) applied on the Primary is assigned a strictly increasi
 `Seq` (a per-primary counter, not per-key). That sequence number is the backbone of
 both guarantees below.
 
-## A bug found in the AI-generated code, and the logging gap it exposed
-
-`WireCodec.ReadMessageAsync` deserializes each frame's payload as JSON. A frame with a
-valid, in-bounds length but a non-JSON payload threw `System.Text.Json.JsonException`,
-which does **not** derive from `IOException` — so it slipped past every
-`catch (IOException)` in `Node.cs`, became an unobserved exception on a fire-and-forget
-connection-handler task, and silently killed the connection: no response to the
-sender, no trace anywhere. This was in the original AI-generated implementation and
-wasn't something the model flagged on its own — found by deliberately tracing what
-happens to a frame whose length is garbage-but-in-range. Fixed at the one place both
-call sites already funnel through: `ReadMessageAsync` now catches `JsonException` and
-re-throws it as `InvalidDataException`, which *does* derive from `IOException`
-(matching the convention `Frame.ReadAsync` already uses for its own bad-length case) —
-so every existing handler now treats malformed JSON the same way it already treats a
-dropped connection, without adding a new catch clause anywhere else.
-
-That the failure was invisible in the first place is the reason `Node` and
-`CacheClient` now take an optional `ILogger` (default `NullLogger`, so nothing breaks
-for callers that don't supply one). Every log line carries the node's own applied
-sequence number alongside its name, deliberately instead of relying on wall-clock time
-to compare events across machines — the assignment's own topology makes clock skew a
-real risk between three real nodes, and `Seq` is already the mechanism this system
-uses to avoid trusting clocks for anything that matters.
-
 ## What a client can rely on
 
 - **Read-your-writes, not linearizability.** `SetAsync`/`DeleteAsync` return the write's
@@ -136,12 +112,8 @@ which is an accepted simplification, not a monitored/alerted condition).
   on an open network.
 - **`Seq` is visible to the caller** (`SetAsync`/`DeleteAsync` return it, `GetAsync`
   takes it as `minSeq`), rather than hidden behind a server-tracked client session.
-  Considered and rejected: the assignment's guarantee is explicitly per-writer, not
-  cluster-wide, so an explicit token the caller passes along is the minimal mechanism
-  that satisfies it. A hidden-session version would need `ClientId` added to the wire
-  protocol and *replicated* alongside every write (a Replica never sees a write
-  directly, only via `REPLICATE`), plus a new unbounded `ClientId → Seq` map on every
-  node - real new surface for no change in the guarantee itself, just API ergonomics.
+  Considered and rejected as unnecessary complexity for an ergonomics-only change —
+  full reasoning in `KeyDecisions.md`.
 
 ## Testing notes
 
