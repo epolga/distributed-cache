@@ -132,45 +132,57 @@ were already running keep whatever they had applied before the crash - they don'
 lose anything themselves, since they didn't restart.
 
 **This isn't just "replicas are now stale" - it's a concrete, reproducible correctness
-bug via `Seq` collision.** When a Replica with, say, `AppliedSeq = 500` reconnects and
-sends `HELLO{AppliedSeq: 500}`, the new Primary's `_log.From(500)` looks at its own
-(empty) history:
+bug, though not the one an earlier draft of this note described.** An earlier version
+of this section claimed the restarted Primary's fresh `Seq=1,2,3...` writes would
+reach the Replica and be silently discarded there, forever, by the dedup check. That
+turned out to be wrong once actually traced against `ReplicationLog.From()` - verified
+with a small standalone repro against the real `ReplicationLog` class, not just by
+re-reading the code:
 
 ```csharp
 public IReadOnlyList<ReplicationEntry> From(long afterSeq)
 {
     if (afterSeq >= _entries.Count) return Array.Empty<ReplicationEntry>();
-    ...
+    int skip = (int)Math.Max(0, afterSeq);
+    return _entries.GetRange(skip, _entries.Count - skip);
 }
 ```
 
-`_entries.Count` is `0`, so `500 >= 0` is true, and it returns nothing - the new
-Primary concludes "you're already caught up," when in reality it just has no history
-at all, old or new.
+`From(afterSeq)` treats `afterSeq` as both a Seq number *and* a list index - correct
+only because, under normal (non-restarted) operation, `Append` assigns
+`Seq = _entries.Count + 1`, so entry at index `i` always has `Seq = i + 1` and the two
+never diverge. A restart breaks that: the log resets to empty and Seq numbering
+restarts at 1, but a Replica's remembered `AppliedSeq` (say, 500) is from the *old*
+numbering. Concretely, with a Replica at `AppliedSeq = 3` and a Primary that just
+restarted:
 
-The new Primary then starts accepting fresh writes and numbering them **from 1
-again**. Those `REPLICATE` messages (`Seq = 1, 2, 3...`) reach the Replica, whose
-dedup check sees:
-
-```csharp
-if (seq <= _appliedSeq.Value) return; // "already applied" - silently skipped
+```
+log.From(3) → 0 entries   (fresh write #1, Seq=1 - never sent)
+log.From(3) → 0 entries   (fresh write #2, Seq=2 - never sent)
+log.From(3) → 0 entries   (fresh write #3, Seq=3 - never sent)
+log.From(3) → [Seq=4]     (fresh write #4 - sent; 4 <= 3? false -> APPLIED)
+log.From(4) → [Seq=5]     (fresh write #5 - sent; 5 <= 4? false -> APPLIED)
 ```
 
-`1 <= 500` is true, so the Replica silently discards every new write from the
-restarted Primary, genuinely believing it has already applied them - when in fact
-these are entirely new writes that happen to carry Seq numbers from a range the
-Replica already passed through in a *previous* incarnation of the Primary. The
-Replica doesn't just lag; it permanently stops receiving new data after a Primary
-restart, with no error anywhere.
+The first three post-restart writes are never transmitted at all - `afterSeq >= count`
+stays true until the new log grows past the Replica's old high-water mark, so they're
+structurally invisible to `From()`, not received-then-deduped. Once the new log grows
+past that mark, sending resumes on its own, and - because the surviving entries'
+(new) Seq values already exceed the Replica's old `AppliedSeq` - the dedup check lets
+them through normally. **Net effect: not a permanent stall, but a silent, bounded loss
+of exactly `AppliedSeq_old` post-restart writes, after which replication self-heals
+with no error or warning anywhere** - not even the "skipped already-applied" warning
+line, since the lost entries are never sent in the first place, only genuinely
+past-threshold ones are.
 
-**What a real fix would need:** `Seq` alone isn't enough to survive a Primary
-restart - it needs to be paired with something that changes every time a new Primary
-process starts (an "epoch" or "generation" number), so a fresh Primary's `Seq=1` can
-never collide with a previous incarnation's `Seq=1` in a Replica's eyes. That epoch
-value would itself need to come from somewhere durable across the Primary's own
-restart (persisted to disk, or derived from wall-clock time at startup) - which loops
-back to the same root cause as everything else in this file: nothing in this system
-survives a process restart, anywhere.
+**What a real fix would need** is unchanged by this correction: `Seq` alone isn't
+enough to survive a Primary restart - it needs to be paired with something that
+changes every time a new Primary process starts (an "epoch"/"generation" number), so
+a fresh Primary's `Seq=1` can never be compared against a Replica's old high-water
+mark as if it were the same numbering scheme. That epoch would itself need to come
+from somewhere durable across the Primary's own restart - which loops back to the
+same root cause as everything else in this file: nothing in this system survives a
+process restart, anywhere.
 
 ## Walking `ReadYourWrites_GetOnReplicaWithMinSeq_NeverObservesStaleValue` end to end
 
